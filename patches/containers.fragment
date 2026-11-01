@@ -1,46 +1,66 @@
-# Droidspaces/LXC container support for xaga GKI kernel 5.10.226
-# Stock GKI 缺这些（/proc/cgroups 实测 devices/pids 不存在）
-# merge_config 会把这些叠在 gki_defconfig 之上
+# ============================================================================
+#  Droidspaces 容器配置 fragment — xaga GKI 5.10.226
+#
+#  严格按官方 Documentation/Kernel-Configuration.md 的 GKI 章节来：
+#  https://github.com/ravindu644/Droidspaces-OSS/blob/main/Documentation/Kernel-Configuration.md
+#
+#  ⚠️ 关键前提：必须同时打 kABI 补丁（见 build.sh 第 3 步），
+#     否则开启 SYSVIPC/IPC_NS/POSIX_MQUEUE 会让厂商模块拒绝加载 → 开机循环。
+# ============================================================================
 
-# ---- 缺失的 cgroup 控制器（硬性需求）----
-CONFIG_CGROUP_DEVICE=y
-CONFIG_CGROUP_PIDS=y
+# ---- IPC（必须，配合 kABI 补丁才 ABI 安全）----
+CONFIG_SYSVIPC=y
+CONFIG_POSIX_MQUEUE=y
 
-# ---- User namespace（Android 出于安全默认关，容器需要）----
+# ---- Namespaces ----
+CONFIG_IPC_NS=y
+CONFIG_PID_NS=y
+
+# ---- 设备节点（容器里访问硬件）----
+CONFIG_DEVTMPFS=y
+
+# ---- 网络：NAT 模式的地址匹配 ----
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+
+# ---- 以下可选但推荐 ----
+# User namespace（Allow Sandboxing / docker unsafe procfs 修复）
 CONFIG_USER_NS=y
 
-# ---- 容器网络：veth / bridge / NAT ----
-CONFIG_VETH=y
-CONFIG_BRIDGE=y
-CONFIG_BRIDGE_NETFILTER=y
-CONFIG_MACVLAN=y
-CONFIG_NETFILTER_ADVANCED=y
-CONFIG_NF_CONNTRACK=y
-CONFIG_NETFILTER_NETLINK=y
-CONFIG_NF_NAT=y
-CONFIG_NF_NAT_REDIRECT=y
-CONFIG_NF_TABLES=y
-CONFIG_IP_NF_IPTABLES=y
-CONFIG_IP_NF_FILTER=y
-CONFIG_IP_NF_NAT=y
-CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y
-CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
-CONFIG_IP6_NF_IPTABLES=y
+# IPv6 NAT（NAT66），不开的话 NAT 容器只有 IPv4
 CONFIG_IP6_NF_NAT=y
+CONFIG_IP6_NF_TARGET_MASQUERADE=y
 
-# ---- Swap（MEMCG_SWAP 依赖）----
-CONFIG_SWAP=y
-CONFIG_MEMCG_SWAP=y
+# Macvlan 模式（--net=macvlan）
+CONFIG_MACVLAN=y
 
-# ---- 文件系统 ----
-CONFIG_BLK_DEV_LOOP=y
-CONFIG_FUSE_FS=y
-CONFIG_TUN=y
+# UFW 支持
+CONFIG_NETFILTER_XT_TARGET_REJECT=y
+CONFIG_NETFILTER_XT_TARGET_LOG=y
+CONFIG_NETFILTER_XT_MATCH_RECENT=y
 
-# ---- 关掉 Android paranoid network（会挡容器 DNS/外网）----
-# CONFIG_ANDROID_PARANOID_NETWORK is not set
+# Fail2ban 支持
+CONFIG_IP_SET=y
+CONFIG_IP_SET_HASH_IP=y
+CONFIG_IP_SET_HASH_NET=y
+CONFIG_NETFILTER_XT_SET=y
 
-# ---- 匹配原厂 vermagic（让原厂 608 个 .ko 正常加载）----
+# tmpfs xattr / posix acl（NixOS 等需要）
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_TMPFS_XATTR=y
+
+# ---- vermagic 对齐原厂 608 个模块 ----
 # 原厂 /proc/version: 5.10.226-android12-9-00047-g4968e29b7f92-ab12786767
-# 5.10.226 来自 Makefile SUBLEVEL，剩余部分靠 LOCALVERSION
+# 5.10.226 来自 Makefile SUBLEVEL，其余部分靠 LOCALVERSION
 CONFIG_LOCALVERSION="-android12-9-00047-g4968e29b7f92-ab12786767"
+
+# ============================================================================
+#  ⛔ 绝对不要开启 —— 破坏 kABI，原厂模块拒绝加载，设备开机循环
+#     （官方文档明确：这两个会改变调度器/cgroup 结构体大小，
+#       在 5.15 树上改动了约 4000 个导出符号的 CRC，没有 padding 能覆盖）
+#
+#  CONFIG_CGROUP_PIDS=y        # --pids-limit 需要，但会炸
+#  CONFIG_CFS_BANDWIDTH=y      # --cpus 需要，但会炸
+#
+#  代价：--cpus 和 --pids-limit 两个开关在 app 里会变灰（跳过并告警）。
+#  其余全部功能（内存限制、网络隔离、overlay、swap 限制）都正常。
+# ============================================================================

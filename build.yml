@@ -1,0 +1,118 @@
+name: Build xaga GKI container kernel
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      target_sublevel:
+        description: '5.10.x sublevel (stock = 226)'
+        required: false
+        default: '226'
+
+# 需要写权限：失败时把报告 commit 回仓库，省掉「下载 artifact → 解压 → 发文件」这一步
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: 腾出磁盘空间
+        run: |
+          # GKI 开了全量 LTO，中间产物 + vmlinux.o 很吃空间，
+          # runner 默认可用空间只有十几 G，先清掉用不到的大件
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: 安装工具链
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q \
+            build-essential bc bison flex libncurses-dev libssl-dev cpio \
+            zstd zip unzip python3 curl git patch file dwarves libelf-dev \
+            clang-12 lld-12 llvm-12
+          echo "---- 工具链自检 ----"
+          /usr/lib/llvm-12/bin/clang --version | head -1
+          /usr/lib/llvm-12/bin/ld.lld --version | head -1
+          pahole --version || true
+          echo "---- 资源 ----"
+          nproc
+          free -h
+          df -h /
+
+      - name: 编译并打包
+        env:
+          TARGET_SUBLEVEL: ${{ github.event.inputs.target_sublevel || '226' }}
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      # 下面两步只在失败时跑。目的是不用你下载 artifact，报告直接进仓库，
+      # 远程也能读到（ci-report/last-error.txt）。
+      - name: 生成失败报告
+        if: failure()
+        run: |
+          mkdir -p ci-report
+          {
+            echo "# 构建失败报告"
+            echo
+            echo "- run id: ${{ github.run_id }}"
+            echo "- 时间(UTC): $(date -u +%FT%TZ)"
+            echo
+            if [ -f artifacts/errors.txt ]; then
+              cat artifacts/errors.txt
+            else
+              echo "## 注意：脚本没写出 errors.txt（在写报告之前就退出了），下面是 build.log 兜底提取"
+              echo
+              echo "### 错误行（最多 80 条）"
+              echo '```'
+              grep -a -nE 'error:|Error [0-9]+$|Killed|No space left|undefined reference|No rule to make' build.log 2>/dev/null | tail -80 || true
+              echo '```'
+              echo
+              echo "### 日志末尾 120 行"
+              echo '```'
+              tail -n 120 build.log 2>/dev/null || true
+              echo '```'
+            fi
+          } > ci-report/last-error.txt
+          echo "报告行数: $(wc -l < ci-report/last-error.txt)"
+          sed -n '1,60p' ci-report/last-error.txt
+
+      - name: 回传报告到仓库
+        if: failure()
+        run: |
+          [ -f ci-report/last-error.txt ] || { echo "没有报告，跳过"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f ci-report/last-error.txt
+          if git commit -m "ci: 构建失败报告 [skip ci]"; then
+            git push origin HEAD:main || echo "推送失败，报告仍在 artifact 里"
+          else
+            echo "内容无变化，不提交"
+          fi
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xaga-gki-kernel
+          path: |
+            artifacts/*
+            ci-report/*
+            build.log
+          if-no-files-found: ignore
+          retention-days: 30

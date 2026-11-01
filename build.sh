@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  xaga GKI 容器内核编译脚本
+#  xaga GKI 容器内核编译脚本  (v3)
 #
 #  路线：AOSP android12-5.10 GKI 5.10.226 + Droidspaces 官方 kABI 补丁
 #
@@ -13,6 +13,14 @@
 #     所以能开这些选项而 ABI 不变
 #   - CGROUP_PIDS / CFS_BANDWIDTH 会改调度器结构体大小，没有 padding 能救，
 #     绝对不能开（代价是 --cpus / --pids-limit 两个开关变灰）
+#
+#  v3 变更：
+#   - 工具链改为「找 LLVM 目录 + 加进 PATH」，不再依赖 ld.lld / ld.lld-12 的
+#     具体文件名（旧版在这里直接 FAIL）
+#   - 修掉 002 补丁被重复打一次的 bug
+#   - 编译失败时自动关掉 DEBUG_INFO / BTF 重试一次（BTF 只影响 BPF CO-RE，
+#     不影响开机、不影响 vermagic）
+#   - 编译摘要直接写进 $GITHUB_STEP_SUMMARY，workflow 里不再需要易出错的多行 shell
 #
 #  用法：
 #    ./build.sh            完整编译 + 打包
@@ -45,16 +53,36 @@ PROBE_ONLY=0
 [ "${1:-}" = "--probe" ] && PROBE_ONLY=1
 
 export ARCH=arm64
+export LC_ALL=C
 
 log()  { printf '\n\033[1;36m==> [%s] %s\033[0m\n' "$(date -u +%H:%M:%S)" "$*"; }
 warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$*"; }
+summary() {
+  # 只在 GitHub Actions 里有意义；本地跑就是空操作
+  [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+  printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"
+}
 die()  {
   printf '\n\033[1;31m[FAIL] %s\033[0m\n' "$*" >&2
+  summary ""
+  summary "### 编译失败"
+  summary ""
+  summary '```'
+  summary "$*"
+  summary '```'
   # 把最后几行再打一遍，方便直接在 Actions 日志末尾看到根因
   if [ -s "$LOG" ]; then
     printf '\033[1;31m---- build.log 末尾 25 行 ----\033[0m\n' >&2
     tail -n 25 "$LOG" >&2 || true
     printf '\033[1;31m-----------------------------\033[0m\n' >&2
+    summary ""
+    summary "<details><summary>build.log 末尾 40 行</summary>"
+    summary ""
+    summary '```'
+    tail -n 40 "$LOG" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+    summary '```'
+    summary ""
+    summary "</details>"
   fi
   exit 1
 }
@@ -65,6 +93,7 @@ trap 'rc=$?; if [ "$rc" != "0" ]; then printf "\n\033[1;31m[TRAP] 第 %s 行异�
 exec > >(tee "$LOG") 2>&1
 
 log "环境：$(uname -m) / 磁盘 $(df -h . | awk 'NR==2{print $4}') 可用 / CPU $(nproc) 核"
+log "目标：5.10.${TARGET_SUBLEVEL} + GKI + Droidspaces（只换 boot 内 Image）"
 
 # --------------------------- 1. 拉源码 --------------------------------------
 # 按 commit 浅取（只下这一个快照），比拉全历史快好几倍；
@@ -102,14 +131,16 @@ fi
 
 # --------------------- 2. 打 Droidspaces kABI 补丁 --------------------------
 # 这一步不是可选的。不打补丁就开 SYSVIPC，设备会开机循环。
+P001_FMT="$PATCH_BASE/001.GKI-below-6.12-fix_sysvipc_kabi_%s.patch"
 P002="$PATCH_BASE/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
 
-log "打 kABI 补丁 001（SYSVIPC → ABI padding）"
+log "打 Droidspaces kABI 补丁 001（SYSVIPC → ABI padding）"
 APPLIED_SLOT=""
 for slot in "$KABI_SLOT" 1_2_3 3_4_5 6_7_8; do
   [ -n "$APPLIED_SLOT" ] && break
-  code=$(curl -fsSL -w '%{http_code}' "$PATCH_BASE/001.GKI-below-6.12-fix_sysvipc_kabi_${slot}.patch" \
-          -o /tmp/001.patch 2>/dev/null || true)
+  url="$(printf "$P001_FMT" "$slot")"
+  rm -f /tmp/001.patch
+  code=$(curl -fsSL -w '%{http_code}' "$url" -o /tmp/001.patch 2>/dev/null || true)
   if [ ! -s /tmp/001.patch ]; then
     warn "001 变体 ${slot} 下载失败（http=$code），换下一个"
     continue
@@ -127,50 +158,81 @@ done
 [ -n "$APPLIED_SLOT" ] || die "001 的三个槽位变体都打不上 —— sched.h 与补丁基线不一致"
 KABI_SLOT="$APPLIED_SLOT"
 
-log "打 kABI 补丁 002（POSIX_MQUEUE → ABI padding）"
+log "打 Droidspaces kABI 补丁 002（POSIX_MQUEUE → ABI padding）"
 curl -fsSL "$P002" -o /tmp/002.patch || die "002 补丁下载失败: $P002"
+[ -s /tmp/002.patch ] || die "002 补丁是空文件: $P002"
+# 只打一次。旧版在这里写了两遍，第二次会命中 "previously applied" 直接失败。
 patch -p1 --forward < /tmp/002.patch || die "002 补丁应用失败（user.h 上下文不匹配）"
-
-log "应用 002（POSIX_MQUEUE → ABI padding）"
-patch -p1 --forward < /tmp/002.patch || die "002 补丁应用失败"
 
 # 确认补丁真的落到了代码里
 grep -q "ANDROID_KABI_USE" include/linux/sched.h \
   || die "001 补丁似乎没生效（include/linux/sched.h 里没有 ANDROID_KABI_USE）"
 grep -q "ANDROID_KABI_USE" include/linux/sched/user.h \
   || die "002 补丁似乎没生效（include/linux/sched/user.h 里没有 ANDROID_KABI_USE）"
-log "kABI 补丁已生效"
+log "kABI 补丁已生效（001 slot=${KABI_SLOT} + 002）"
 
 # --------------------------- 3. 工具链 --------------------------------------
 # AOSP GKI 5.10 官方用 clang-r416183b（12.0.5），原厂内核也是它编的。
-# clang-14 会在一堆 -Werror 上直接崩，所以优先 clang-12。
-log "检查工具链"
+# 但不同环境给的工具名不一样（clang / clang-12 / ld.lld / ld.lld-12），
+# 所以这里不猜文件名，而是找一个同时含 clang+ld.lld+llvm-ar 的 LLVM bin 目录，
+# 把它塞到 PATH 最前面，然后用 CC=clang LLVM=1 统一交给 kbuild。
+log "准备工具链"
 
 if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
 ensure_pkgs() {
   local miss=()
   for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || miss+=("$p"); done
-  [ ${#miss[@]} -eq 0 ] && return 0
+  if [ "${#miss[@]}" -eq 0 ]; then return 0; fi
   log "补装依赖：${miss[*]}"
-  command -v apt-get >/dev/null 2>&1 || { warn "缺 ${miss[*]}，且没有 apt-get"; return 1; }
-  $SUDO apt-get install -y -q "${miss[@]}" >/dev/null 2>&1 || { warn "安装 ${miss[*]} 失败"; return 1; }
+  command -v apt-get >/dev/null 2>&1 || { warn "没有 apt-get，无法安装 ${miss[*]}"; return 1; }
+  $SUDO apt-get update -qq >/dev/null 2>&1 || true
+  if $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${miss[@]}" >/dev/null 2>&1; then
+    log "已安装：${miss[*]}"
+  else
+    warn "安装 ${miss[*]} 失败（可能没有对应包），继续尝试已有工具"
+    return 1
+  fi
 }
 # pahole（dwarves）是 CONFIG_DEBUG_INFO_BTF 必需，libelf-dev 是 objtool 必需
-ensure_pkgs clang-12 lld-12 llvm-12 dwarves libelf-dev || true
+ensure_pkgs clang-12 lld-12 llvm-12 dwarves libelf-dev patch bc bison flex \
+             libncurses-dev libssl-dev cpio zstd zip unzip || true
 
-if command -v clang-12 >/dev/null 2>&1 && command -v ld.lld-12 >/dev/null 2>&1; then
-  CLI_CC=clang-12
-  LLVM_ARG=-12
-elif command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1; then
-  CLI_CC=clang
-  LLVM_ARG=1
-  warn "没有 clang-12，退用系统 clang（版本偏新，可能触发 -Werror）"
-else
-  die "找不到 clang（workflow 应装 clang-12 lld-12）"
+pick_llvm() {
+  local d
+  LLVM_BIN=""
+  # 1) PATH 里本来就是一对（clang + ld.lld + llvm-ar 同目录）
+  if command -v clang >/dev/null 2>&1; then
+    d="$(cd "$(dirname "$(command -v clang)")" && pwd)"
+    if [ -x "$d/ld.lld" ] && [ -x "$d/llvm-ar" ]; then LLVM_BIN="$d"; fi
+  fi
+  # 2) 版本化目录，12 优先（= AOSP GKI 5.10 原厂版本），再到新的
+  if [ -z "$LLVM_BIN" ]; then
+    for d in /usr/lib/llvm-12/bin /usr/lib/llvm-13/bin /usr/lib/llvm-14/bin \
+             /usr/lib/llvm-15/bin /usr/lib/llvm-16/bin /usr/lib/llvm-17/bin; do
+      if [ -x "$d/clang" ] && [ -x "$d/ld.lld" ] && [ -x "$d/llvm-ar" ]; then
+        LLVM_BIN="$d"; break
+      fi
+    done
+  fi
+}
+pick_llvm
+
+if [ -z "$LLVM_BIN" ]; then
+  warn "没找到完整 LLVM 目录，当前可见工具："
+  ls -1 /usr/lib/llvm-*/bin/ld.lld 2>/dev/null | sed 's/^/    /' || true
+  command -v clang 2>/dev/null | sed 's/^/    clang: /' || true
+  command -v ld.lld 2>/dev/null | sed 's/^/    ld.lld: /' || true
+  die "没有可用的 clang+ld.lld 组合。请确保已安装 clang-12 / lld-12（或 clang / lld）"
 fi
-command -v pahole >/dev/null 2>&1 || warn "没有 pahole，若 gki_defconfig 开了 DEBUG_INFO_BTF 会失败"
-CLANG_VER="$($CLI_CC --version | head -1)"
-log "工具链：$CLANG_VER （LLVM=$LLVM_ARG）"
+export PATH="$LLVM_BIN:$PATH"
+
+CLANG_VER="$(clang --version | head -1)"
+LLD_VER="$(ld.lld --version | head -1)"
+log "LLVM 目录：$LLVM_BIN"
+log "clang：$CLANG_VER"
+log "ld.lld：$LLD_VER"
+
+command -v pahole >/dev/null 2>&1 || warn "没有 pahole，若开了 DEBUG_INFO_BTF 会失败（下面有自动重试）"
 
 # --------------------------- 4. 生成配置 ------------------------------------
 log "合并 gki_defconfig + Droidspaces fragment"
@@ -191,6 +253,7 @@ fi
 # 抑制 setlocalversion（版本串只保留 CONFIG_LOCALVERSION 的原值）
 touch .scmversion
 
+log "olddefconfig"
 make ARCH=arm64 O="$OUT" olddefconfig 2>&1 | tail -5
 
 # --------------------------- 5. 配置校验 ------------------------------------
@@ -211,7 +274,7 @@ done
 log "检查 kABI 红线项"
 for s in CONFIG_CGROUP_PIDS CONFIG_CFS_BANDWIDTH; do
   if grep -qx "$s=y" "$OUT/.config"; then
-    die "$s 被开启了 —— 这会破坏 kABI，原厂 608 个模块会拒绝加载，设备开机循环！必须从配置里去掉。代价只是 --cpus/--pids-limit 两个开关变灰。"
+    die "$s 被开启了 —— 这会破坏 kABI，原厂 608 个模块会拒绝加载，设备开机循环！代价只是 --cpus/--pids-limit 两个开关变灰。"
   else
     printf '  \033[32mOK\033[0m   %s 未开启（符合 kABI 安全要求）\n' "$s"
   fi
@@ -224,38 +287,62 @@ log "LOCALVERSION = $LV"
   || die "LOCALVERSION 不匹配原厂！期望: $STOCK_LOCALVERSION, 实际: $LV"
 
 # --------------------------- 6. 编译 ----------------------------------------
-log "编译 Image.gz（-j$JOBS）"
-# 不传 LOCALVERSION=（会覆盖 CONFIG_LOCALVERSION）
-# || true 让 make 失败不立即退出，下面检查 Image.gz 并输出错误
-make ARCH=arm64 O="$OUT" \
-  CC="$CLI_CC" LLVM="$LLVM_ARG" LLVM_IAS=1 \
-  KCFLAGS="-D__ANDROID_COMMON_KERNEL__" \
-  -j"$JOBS" Image.gz 2>&1 | tail -60 || true
+build_kernel() {
+  # 不传 LOCALVERSION=（会覆盖 CONFIG_LOCALVERSION）
+  make ARCH=arm64 O="$OUT" \
+    CC=clang LLVM=1 LLVM_IAS=1 \
+    KCFLAGS="-D__ANDROID_COMMON_KERNEL__" \
+    -j"$JOBS" Image.gz
+}
 
-if [ ! -f "$OUT/arch/arm64/boot/Image.gz" ]; then
+IMG="$OUT/arch/arm64/boot/Image.gz"
+
+log "编译 Image.gz（-j$JOBS）"
+set +e
+build_kernel 2>&1 | tail -80
+RC=${PIPESTATUS[0]}
+set -e
+
+if [ "$RC" -ne 0 ] || [ ! -f "$IMG" ]; then
+  warn "首次编译失败（rc=$RC / Image.gz 存在=$([ -f "$IMG" ] && echo yes || echo no)）"
+  warn "关闭 DEBUG_INFO / BTF 后重试（只影响调试信息与 BPF CO-RE，不影响开机与 vermagic）"
+  for opt in DEBUG_INFO_BTF MODULES_DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES DEBUG_INFO; do
+    "$KERNEL_DIR/scripts/config" --file "$OUT/.config" -d "$opt" 2>/dev/null || true
+  done
+  make ARCH=arm64 O="$OUT" olddefconfig >/dev/null 2>&1 || true
+  set +e
+  build_kernel 2>&1 | tail -80
+  RC=${PIPESTATUS[0]}
+  set -e
+fi
+
+if [ ! -f "$IMG" ]; then
   echo
   echo "======== build.log 最后 80 行 ========"
   tail -80 "$LOG" 2>/dev/null || true
   echo "======================================"
-  die "Image.gz 没生成 —— 见上面的编译错误"
+  die "Image.gz 没生成（rc=$RC） —— 见上面的编译错误"
 fi
-log "Image.gz 生成成功"
+gzip -t "$IMG" || die "Image.gz 不是合法的 gzip 文件"
+log "Image.gz 生成成功（$(du -h "$IMG" | cut -f1)）"
 
 # --------------------------- 7. 收集产物 ------------------------------------
 rm -rf "$ART" && mkdir -p "$ART"
-cp -f "$OUT/arch/arm64/boot/Image.gz" "$ART/Image.gz"
+cp -f "$IMG" "$ART/Image.gz"
 
 # 验证版本串（kernel.release 就是 vermagic 里的版本部分，必须与原厂一致）
 KR="$(cat "$OUT/include/config/kernel.release" 2>/dev/null || true)"
 [ -n "$KR" ] || KR="$(make -s ARCH=arm64 O="$OUT" kernelrelease 2>/dev/null || echo unknown)"
 echo "  kernel.release: $KR"
-STOCK_RELEASE="5.10.226-android12-9-00047-g4968e29b7f92-ab12786767"
+STOCK_RELEASE="5.10.${TARGET_SUBLEVEL}${STOCK_LOCALVERSION}"
 if [ "$KR" = "$STOCK_RELEASE" ]; then
   log "版本串与原厂完全一致 ✓ 原厂 .ko 可直接加载"
 else
-  warn "版本串与原厂不一致（期望 $STOCK_RELEASE），原厂 .ko 会拒绝加载"
+  # 不一致的包刷进去必然开机循环（608 个厂商模块的 vermagic 对不上），宁可不给
+  die "版本串与原厂不一致！期望 $STOCK_RELEASE，实际 $KR —— 这个包不能刷，会开机循环"
 fi
 
+IMAGE_SHA="$(sha256sum "$ART/Image.gz" | cut -d' ' -f1)"
 {
   echo "kernel_version=$KVER"
   echo "kernel_release=$KR"
@@ -264,12 +351,10 @@ fi
   echo "kabi_slot=$KABI_SLOT"
   echo "localversion=$LV"
   echo "clang=$CLANG_VER"
-  echo "image_sha256=$(sha256sum "$ART/Image.gz" | cut -d' ' -f1)"
+  echo "lld=$LLD_VER"
+  echo "image_sha256=$IMAGE_SHA"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$ART/BUILD-INFO.txt"
-
-log "产物"
-ls -lh "$ART"
 
 # --------------------------- 8. 打 AnyKernel3 boot-only 包 ------------------
 log "打 AnyKernel3 boot-only 包"
@@ -293,7 +378,7 @@ for f in dtb dtbo.img Image Image-dtb; do
   [ -e "$WORK/$f" ] && die "包根目录出现 $f，必须移除"
 done
 
-ZIP="$ART/xaga-gki-5.10.226-containers-$(date -u +%Y%m%d).zip"
+ZIP="$ART/xaga-gki-5.10.${TARGET_SUBLEVEL}-containers-$(date -u +%Y%m%d).zip"
 rm -f "$ZIP"
 cd "$WORK"
 zip -r9 -q "$ZIP" anykernel.sh Image.gz tools META-INF || die "zip 打包失败"
@@ -309,11 +394,27 @@ done
 ( cd "$ART" && sha256sum "$(basename "$ZIP")" > "$(basename "$ZIP").sha256" )
 
 log "完成"
-ls -lh "$ZIP" "$ZIP.sha256"
+ls -lh "$ART"
+
+# --------------------------- 9. 摘要 ----------------------------------------
+summary ""
+summary "### 编译成功"
+summary ""
+summary "| 项 | 值 |"
+summary "| --- | --- |"
+summary "| 内核 | \`$KVER\` |"
+summary "| kernel.release | \`$KR\` |"
+summary "| kABI 补丁 | 001(slot=$KABI_SLOT) + 002 |"
+summary "| clang | \`$CLANG_VER\` |"
+summary "| 刷机包 | \`$(basename "$ZIP")\` |"
+summary ""
+summary "只写 boot 分区，不碰 vendor_dlkm / vendor_boot。\`--cpus\` / \`--pids-limit\` 不可用（kABI 安全代价）。"
+
 echo
 echo "============================================================"
 echo " 内核：$KVER   LOCALVERSION：$LV"
 echo " kABI 补丁：001($KABI_SLOT) + 002"
+echo " 工具链：$CLANG_VER"
 echo " 卡刷包：$ZIP"
 echo " 只写 boot 分区，不碰 vendor_dlkm / vendor_boot"
 echo " --cpus / --pids-limit 不可用（kABI 安全代价），其余功能正常"

@@ -22,6 +22,12 @@
 #     不影响开机、不影响 vermagic）
 #   - 编译摘要直接写进 $GITHUB_STEP_SUMMARY，workflow 里不再需要易出错的多行 shell
 #
+#  v4 变更（这一版才真正能编）：
+#   - 补上交叉编译目标三元组 --target=aarch64-linux-gnu。5.10 的 Makefile 只在
+#     CROSS_COMPILE 非空时才加 --target=，否则 clang 按 x86_64 编，arm64 内联汇编
+#     全报 "unknown register name 'x0'"，编译在 kernel/bounds.s 就挂
+#   - 编译前先做一次 4 行的交叉编译自检，目标不对立刻失败，不浪费 40 分钟
+#
 #  用法：
 #    ./build.sh            完整编译 + 打包
 #    ./build.sh --probe    只探测版本，不编译
@@ -60,7 +66,7 @@ warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$*"; }
 summary() {
   # 只在 GitHub Actions 里有意义；本地跑就是空操作
   [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
-  printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"
+  printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 }
 die()  {
   printf '\n\033[1;31m[FAIL] %s\033[0m\n' "$*" >&2
@@ -234,6 +240,28 @@ log "ld.lld：$LLD_VER"
 
 command -v pahole >/dev/null 2>&1 || warn "没有 pahole，若开了 DEBUG_INFO_BTF 会失败（下面有自动重试）"
 
+# ---- 目标三元组：这一步曾经把整轮编译搞挂 ----
+# 5.10 的 Makefile 只有「CROSS_COMPILE 非空」时才会加 --target=，
+# 不传的话 clang 按宿主机 x86_64 编，arm64 内联汇编（asm("x0")）全部报
+# "unknown register name"，像这次的 kernel/bounds.s。
+# 这里直接把 --target 塞进 CC，比设 CROSS_COMPILE 更干净：
+# 设 CROSS_COMPILE 会让 Makefile 再去 which aarch64-linux-gnu-elfedit 拼
+# --prefix=/--gcc-toolchain=，没装交叉 binutils 时会拼出 "./aarch64-linux-gnu" 这种垃圾值。
+TARGET_TRIPLE="aarch64-linux-gnu"
+MAKE_TOOL_ARGS=(CC="clang --target=$TARGET_TRIPLE" LLVM=1 LLVM_IAS=1)
+
+log "验证交叉编译目标：$TARGET_TRIPLE"
+printf 'int __xaga_probe;\n' > /tmp/probe.c
+if ! clang --target="$TARGET_TRIPLE" -c /tmp/probe.c -o /tmp/probe.o 2>/tmp/probe.log; then
+  tail -5 /tmp/probe.log | sed 's/^/    /' || true
+  die "clang 无法以 $TARGET_TRIPLE 为目标编译"
+fi
+if command -v llvm-readelf >/dev/null 2>&1; then
+  llvm-readelf -h /tmp/probe.o | grep -qi 'aarch64' \
+    || die "测试编译出的 .o 不是 AArch64 —— 交叉编译没生效，编下去只会得到一堆 x0 寄存器错误"
+fi
+log "目标确认：生成的 .o 为 AArch64 ✓"
+
 # --------------------------- 4. 生成配置 ------------------------------------
 log "合并 gki_defconfig + Droidspaces fragment"
 rm -rf "$OUT" && mkdir -p "$OUT"
@@ -290,7 +318,7 @@ log "LOCALVERSION = $LV"
 build_kernel() {
   # 不传 LOCALVERSION=（会覆盖 CONFIG_LOCALVERSION）
   make ARCH=arm64 O="$OUT" \
-    CC=clang LLVM=1 LLVM_IAS=1 \
+    "${MAKE_TOOL_ARGS[@]}" \
     KCFLAGS="-D__ANDROID_COMMON_KERNEL__" \
     -j"$JOBS" Image.gz
 }
@@ -351,6 +379,7 @@ IMAGE_SHA="$(sha256sum "$ART/Image.gz" | cut -d' ' -f1)"
   echo "kabi_slot=$KABI_SLOT"
   echo "localversion=$LV"
   echo "clang=$CLANG_VER"
+  echo "clang_target=$TARGET_TRIPLE"
   echo "lld=$LLD_VER"
   echo "image_sha256=$IMAGE_SHA"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

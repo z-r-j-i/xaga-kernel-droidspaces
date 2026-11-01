@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  xaga GKI 容器内核编译脚本  (v3)
+#  xaga GKI 容器内核编译脚本  (v7)
 #
 #  路线：AOSP android12-5.10 GKI 5.10.226 + Droidspaces 官方 kABI 补丁
 #
@@ -31,6 +31,16 @@
 #  用法：
 #    ./build.sh            完整编译 + 打包
 #    ./build.sh --probe    只探测版本，不编译
+#
+#  v7 变更（专治「失败但看不到原因」）：
+#   - 编译输出不再经过 tail：全量 tee 进 build.log，屏幕只透传 error/LD/AR 等关键行，
+#     避免 Actions 日志长度上限把末尾的失败报告冲掉
+#   - build.log 改为 append 模式写（tee -a），否则脚本日志和 make 输出两个写者
+#     的文件偏移会互相覆盖，日志变乱码
+#   - 失败报告不再只 tail 一段：抓「全部 error 行 + 首个错误上下文 + make 失败目标
+#     + 内核 OOM 记录 + 磁盘/内存快照 + 末尾 150 行」，整份打印并写 artifacts/errors.txt
+#   - 并发按内存自适应（GKI 全量 LTO 一个 clang 进程峰值 2GB 级，-j4 可能 OOM；
+#     OOM 的特征正是「日志里没有任何 error: 行，make 直接 Error 2」）
 # ============================================================================
 set -euo pipefail
 
@@ -54,7 +64,19 @@ OUT="$SCRIPT_DIR/out"
 ART="$SCRIPT_DIR/artifacts"
 LOG="$SCRIPT_DIR/build.log"
 
-JOBS="${JOBS:-$(nproc)}"
+# 并发数：GKI 开了全量 LTO，单个 clang 进程峰值 1.5~2.5GB，
+# 链接阶段 lld 单独要 4~8GB。4 核 16G 的 runner 上无脑 -j4 有 OOM 风险，
+# OOM 会表现为「没有任何 error: 行、make 直接 Error 2」，极难排查，所以这里按内存压一压。
+_nproc="$(nproc 2>/dev/null || echo 4)"
+_mem_mb="$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+JOBS="${JOBS:-$_nproc}"
+if [ "${_mem_mb:-0}" -gt 0 ] 2>/dev/null; then
+  _by_mem=$(( _mem_mb / 2600 ))
+  [ "$_by_mem" -ge 1 ] || _by_mem=1
+  if [ "$JOBS" -gt "$_by_mem" ]; then
+    JOBS="$_by_mem"
+  fi
+fi
 PROBE_ONLY=0
 [ "${1:-}" = "--probe" ] && PROBE_ONLY=1
 
@@ -93,10 +115,20 @@ die()  {
   exit 1
 }
 # set -e 触发的隐式退出也要留下行号（否则只看到 "exit code 2"，不知道哪一步）
-trap 'rc=$?; if [ "$rc" != "0" ]; then printf "\n\033[1;31m[TRAP] 第 %s 行异常退出，退出码 %s\033[0m\n" "$LINENO" "$rc" >&2; fi' ERR
+# 注意：ERR trap 在 set +e 下也会触发，所以「预期内的失败」要主动 trap '' ERR 屏蔽
+on_err() {
+  local rc=$?
+  if [ "$rc" != "0" ]; then
+    printf "\n\033[1;31m[TRAP] 第 %s 行异常退出，退出码 %s\033[0m\n" "$LINENO" "$rc" >&2
+  fi
+}
+trap on_err ERR
 
 # 全程 tee 到 build.log，失败时 workflow 能作为 artifact 上传
-exec > >(tee "$LOG") 2>&1
+# 必须用 append 模式：编译阶段 make 的输出是直接 >>$LOG 的，
+# 如果 tee 用截断模式，两个写者的文件偏移各自独立，会互相覆盖，日志变乱码
+: > "$LOG"
+exec > >(tee -a "$LOG") 2>&1
 
 log "环境：$(uname -m) / 磁盘 $(df -h . | awk 'NR==2{print $4}') 可用 / CPU $(nproc) 核 / 内存 $(free -h 2>/dev/null | awk '/^Mem:/{print $2}')"
 log "目标：5.10.${TARGET_SUBLEVEL} + GKI + Droidspaces（只换 boot 内 Image）"
@@ -309,7 +341,7 @@ for s in CONFIG_CGROUP_PIDS CONFIG_CFS_BANDWIDTH; do
 done
 
 # 验证 LOCALVERSION（决定 vermagic 是否匹配原厂模块）
-LV="$(grep '^CONFIG_LOCALVERSION=' "$OUT/.config" | cut -d'"' -f2)"
+LV="$(grep '^CONFIG_LOCALVERSION=' "$OUT/.config" | cut -d'"' -f2 || true)"
 log "LOCALVERSION = $LV"
 [ "$LV" = "$STOCK_LOCALVERSION" ] \
   || die "LOCALVERSION 不匹配原厂！期望: $STOCK_LOCALVERSION, 实际: $LV"
@@ -324,59 +356,112 @@ build_kernel() {
     -j"$JOBS" Image.gz
 }
 
-# 从完整日志里把「真正的报错」挖出来。
-# 失败时 make 的收尾行永远是 "make[1]: *** [Makefile:192: __sub-make] Error 2"，
-# 而 clang 的 error: 往往在几百行之前，直接 tail 只会看到一堆 CC。
+# 失败时把关键信息挖出来。
+# 硬性要求：这里任何一步失败都不许让脚本提前退出 —— v5 就是栽在
+# n="$(grep ... )" 上（没匹配到 → grep 返回 1 → pipefail → 赋值失败 → set -e 直接退出，
+# 结果既没打摘要也没打 [FAIL]）。所以每处都加 || true，产物先落盘再打印。
+#
+# v7 加强：不再只 tail 一段，而是把「全部 error 行 + 首个错误上下文 + OOM 记录 +
+# 结尾 150 行」一起写进 artifacts/errors.txt，并整份打到屏幕上。
+# 原因：上一轮日志末尾只有 "AR kernel/built-in.a → make Error 2"，真正的
+# error: 在几百行之前，靠 tail 永远看不到。
 show_build_errors() {
-  local log="$1" n from excerpt
+  local log="$1"
   [ -s "$log" ] || return 0
-  echo
-  echo "================ 编译失败摘要 ================"
-  echo "---- 失败的目标（make 收尾行）----"
-  grep -aE '\*\*\*|Error [0-9]+' "$log" | tail -6 | sed 's/^/  /' || true
 
-  n="$(grep -anE '(^|[[:space:]/])(fatal )?error:' "$log" | head -1 | cut -d: -f1)"
-  if [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null; then
-    from=$(( n > 25 ? n - 25 : 1 ))
-    echo "---- 首个 error: 在第 ${n} 行，前 25 行上下文 ----"
-    excerpt="$(sed -n "${from},$((n + 6))p" "$log")"
-  else
-    echo "---- 日志里没有 'error:'，打印倒数 120 行 ----"
-    from=0
-    excerpt="$(tail -n 120 "$log")"
+  local total makes errs n from ctx oom line
+  total="$(wc -l < "$log" 2>/dev/null | tr -d ' ' || true)"
+
+  # [1] make 的失败目标收尾行：能直接看出是哪个 .o / 哪个目录挂了
+  makes="$(grep -aE '\*\*\* \[|Error [0-9]+$|Killed' "$log" 2>/dev/null | tail -12 || true)"
+  # [2] 所有错误行（全量，不截断到几行）
+  errs="$(grep -aE '(^|[[:space:]/])(fatal )?error:|undefined reference to|No space left on device|Killed|internal compiler error|clang: error' "$log" 2>/dev/null | head -80 || true)"
+  # [3] 首个错误的行号
+  n="$(grep -anE '(^|[[:space:]/])(fatal )?error:|undefined reference to|No space left on device|Killed' "$log" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+
+  ctx=""
+  if [ -n "${n:-}" ] && [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+    from=$(( n > 30 ? n - 30 : 1 ))
+    ctx="$(sed -n "${from},$((n + 10))p" "$log" 2>/dev/null || true)"
   fi
-  printf '%s\n' "$excerpt"
-  echo "============================================="
+  [ -n "$ctx" ] || ctx="$(tail -n 200 "$log" 2>/dev/null || true)"
 
-  # 顺手存一份小文件进 artifacts：几 KB，手机上也能直接打开看/发出来，
-  # 不用去翻几十 MB 的 build.log，也不用被浏览器翻译糟蹋
+  # [4] 内核 OOM 记录（OOM 时日志里没有 error:，只有进程被 Killed）
+  oom="$( { dmesg 2>/dev/null || sudo dmesg 2>/dev/null; } | grep -aiE 'killed process|out of memory' | tail -5 || true)"
+
+  print_report() {
+    echo "==== [1] make 失败目标 ===="
+    printf '%s\n' "${makes:-（无）}"
+    echo
+    echo "==== [2] 全部 error / 致命行（最多 80 条）===="
+    printf '%s\n' "${errs:-（无 error 行）}"
+    echo
+    echo "==== [3] 首个错误上下文（第 ${n:-?} 行）===="
+    printf '%s\n' "$ctx"
+    echo
+    if [ -n "${oom:-}" ]; then
+      echo "==== [4] 内核 OOM 记录 ===="
+      printf '%s\n' "$oom"
+      echo
+    fi
+    echo "==== [5] 日志末尾 150 行 ===="
+    tail -n 150 "$log" 2>/dev/null || true
+  }
+
   mkdir -p "$ART" 2>/dev/null || true
   {
-    echo "xaga GKI 编译失败摘要"
+    echo "xaga GKI 编译失败报告"
     echo "时间: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "阶段行号: 见 build.log"
+    echo "内核: $KVER   并发: -j$JOBS   日志行数: ${total:-?}"
+    echo "clang: ${CLANG_VER:-?}   lld: ${LLD_VER:-?}"
+    echo "磁盘: $(df -h "$PWD" 2>/dev/null | awk 'NR==2{print $4" 可用 / 已用 "$5}')"
+    echo "内存: $(free -h 2>/dev/null | awk '/^Mem:/{print $2" 总 / 可用 "$7}')"
     echo
-    echo "---- make 收尾行 ----"
-    grep -aE '\*\*\*|Error [0-9]+' "$log" | tail -6
-    echo
-    if [ "$from" -gt 0 ] 2>/dev/null; then
-      echo "---- 首个 error: 在第 ${n} 行，前 25 行上下文 ----"
-    else
-      echo "---- 倒数 120 行 ----"
-    fi
-    printf '%s\n' "$excerpt"
+    print_report
   } > "$ART/errors.txt" 2>/dev/null || true
+
+  echo
+  echo "================ 编译失败报告 ================"
+  print_report
+  echo "============================================="
+
   summary ""
-  summary "### 编译失败（详见 artifact 里的 errors.txt）"
+  summary "### 编译失败"
+  if [ -n "${errs:-}" ]; then
+    summary ""
+    summary '```'
+    while IFS= read -r line; do summary "$line"; done \
+      <<< "$(printf '%s\n' "$errs" | sed -n '1,15p' || true)"
+    summary '```'
+  fi
+  summary ""
+  summary "完整报告见 artifact 里的 \`errors.txt\`"
+  return 0
 }
 
 IMG="$OUT/arch/arm64/boot/Image.gz"
 
+# 屏幕上只透传「错误 + 链接/打包」类关键行。完整输出在 build.log。
+# 全量打到 stdout 会被 Actions 的日志长度上限截断，反而把末尾的失败报告冲掉 ——
+# 上一轮就是这样，最后 40 行只剩一串 CC/AR。
+ALERT_RE='(^|[[:space:]])(error|fatal error):|Error [0-9]+$|\*\*\* |Killed|No space left on device|undefined reference to|internal compiler error|^  (LD|AR|MODPOST|BTF|OBJCOPY|LTO|VDSOSYM|Kernel: )'
+
+run_build() {
+  # 完整输出 tee 进 build.log，过滤后的关键行显示在屏幕上。
+  # 返回值必须是 make 的退出码（PIPESTATUS[0]）——函数返回后 PIPESTATUS 会被重置，
+  # 所以必须在这里立刻 return。
+  build_kernel 2>&1 | tee -a "$LOG" | grep --line-buffered -aE "$ALERT_RE"
+  return "${PIPESTATUS[0]}"
+}
+
 log "编译 Image.gz（-j$JOBS）"
+log "编译输出全部写入 build.log；屏幕上只会出现错误行和链接/打包行，长时间无新行属正常"
+trap '' ERR
 set +e
-build_kernel 2>&1 | tail -40
-RC=${PIPESTATUS[0]}
+run_build
+RC=$?
 set -e
+trap on_err ERR
 
 if [ "$RC" -ne 0 ] || [ ! -f "$IMG" ]; then
   warn "首次编译失败（rc=$RC / Image.gz 存在=$([ -f "$IMG" ] && echo yes || echo no)）"
@@ -388,10 +473,12 @@ if [ "$RC" -ne 0 ] || [ ! -f "$IMG" ]; then
       "$KERNEL_DIR/scripts/config" --file "$OUT/.config" -d "$opt" 2>/dev/null || true
     done
     make ARCH=arm64 O="$OUT" olddefconfig >/dev/null 2>&1 || true
+    trap '' ERR
     set +e
-    build_kernel 2>&1 | tail -40
-    RC=${PIPESTATUS[0]}
+    run_build
+    RC=$?
     set -e
+    trap on_err ERR
   else
     warn "与 BTF 无关，跳过重试直接报错"
   fi
@@ -454,7 +541,9 @@ cp -f "$ART/Image.gz" "$WORK/Image.gz"
 [ -f "$WORK/tools/magiskboot" ]  || die "缺少 tools/magiskboot"
 grep -qx 'device.name1=xaga' "$WORK/anykernel.sh" || die "devicecheck 未指向 xaga"
 for f in dtb dtbo.img Image Image-dtb; do
-  [ -e "$WORK/$f" ] && die "包根目录出现 $f，必须移除"
+  # 末尾的 || true 不能省：最后一轮 [ -e ] 为假时，for 会返回 1，set -e 会
+  # 在打包最后一步把脚本静默干掉
+  [ -e "$WORK/$f" ] && die "包根目录出现 $f，必须移除" || true
 done
 
 ZIP="$ART/xaga-gki-5.10.${TARGET_SUBLEVEL}-containers-$(date -u +%Y%m%d).zip"

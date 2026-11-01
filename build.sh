@@ -76,11 +76,11 @@ die()  {
   summary '```'
   summary "$*"
   summary '```'
-  # 把最后几行再打一遍，方便直接在 Actions 日志末尾看到根因
+  # 只补最后 8 行，真正的 error 由调用方 show_build_errors 打
   if [ -s "$LOG" ]; then
-    printf '\033[1;31m---- build.log 末尾 25 行 ----\033[0m\n' >&2
-    tail -n 25 "$LOG" >&2 || true
-    printf '\033[1;31m-----------------------------\033[0m\n' >&2
+    printf '\033[1;31m---- build.log 末尾 8 行 ----\033[0m\n' >&2
+    tail -n 8 "$LOG" >&2 || true
+    printf '\033[1;31m----------------------------\033[0m\n' >&2
     summary ""
     summary "<details><summary>build.log 末尾 40 行</summary>"
     summary ""
@@ -98,7 +98,7 @@ trap 'rc=$?; if [ "$rc" != "0" ]; then printf "\n\033[1;31m[TRAP] 第 %s 行异�
 # 全程 tee 到 build.log，失败时 workflow 能作为 artifact 上传
 exec > >(tee "$LOG") 2>&1
 
-log "环境：$(uname -m) / 磁盘 $(df -h . | awk 'NR==2{print $4}') 可用 / CPU $(nproc) 核"
+log "环境：$(uname -m) / 磁盘 $(df -h . | awk 'NR==2{print $4}') 可用 / CPU $(nproc) 核 / 内存 $(free -h 2>/dev/null | awk '/^Mem:/{print $2}')"
 log "目标：5.10.${TARGET_SUBLEVEL} + GKI + Droidspaces（只换 boot 内 Image）"
 
 # --------------------------- 1. 拉源码 --------------------------------------
@@ -317,39 +317,89 @@ log "LOCALVERSION = $LV"
 # --------------------------- 6. 编译 ----------------------------------------
 build_kernel() {
   # 不传 LOCALVERSION=（会覆盖 CONFIG_LOCALVERSION）
-  make ARCH=arm64 O="$OUT" \
+  # -O：并行编译时把每个目标的输出整块打印，避免 error 被几十行 CC 冲散
+  make ARCH=arm64 O="$OUT" -O \
     "${MAKE_TOOL_ARGS[@]}" \
     KCFLAGS="-D__ANDROID_COMMON_KERNEL__" \
     -j"$JOBS" Image.gz
+}
+
+# 从完整日志里把「真正的报错」挖出来。
+# 失败时 make 的收尾行永远是 "make[1]: *** [Makefile:192: __sub-make] Error 2"，
+# 而 clang 的 error: 往往在几百行之前，直接 tail 只会看到一堆 CC。
+show_build_errors() {
+  local log="$1" n from excerpt
+  [ -s "$log" ] || return 0
+  echo
+  echo "================ 编译失败摘要 ================"
+  echo "---- 失败的目标（make 收尾行）----"
+  grep -aE '\*\*\*|Error [0-9]+' "$log" | tail -6 | sed 's/^/  /' || true
+
+  n="$(grep -anE '(^|[[:space:]/])(fatal )?error:' "$log" | head -1 | cut -d: -f1)"
+  if [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null; then
+    from=$(( n > 25 ? n - 25 : 1 ))
+    echo "---- 首个 error: 在第 ${n} 行，前 25 行上下文 ----"
+    excerpt="$(sed -n "${from},$((n + 6))p" "$log")"
+  else
+    echo "---- 日志里没有 'error:'，打印倒数 120 行 ----"
+    from=0
+    excerpt="$(tail -n 120 "$log")"
+  fi
+  printf '%s\n' "$excerpt"
+  echo "============================================="
+
+  # 顺手存一份小文件进 artifacts：几 KB，手机上也能直接打开看/发出来，
+  # 不用去翻几十 MB 的 build.log，也不用被浏览器翻译糟蹋
+  mkdir -p "$ART" 2>/dev/null || true
+  {
+    echo "xaga GKI 编译失败摘要"
+    echo "时间: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "阶段行号: 见 build.log"
+    echo
+    echo "---- make 收尾行 ----"
+    grep -aE '\*\*\*|Error [0-9]+' "$log" | tail -6
+    echo
+    if [ "$from" -gt 0 ] 2>/dev/null; then
+      echo "---- 首个 error: 在第 ${n} 行，前 25 行上下文 ----"
+    else
+      echo "---- 倒数 120 行 ----"
+    fi
+    printf '%s\n' "$excerpt"
+  } > "$ART/errors.txt" 2>/dev/null || true
+  summary ""
+  summary "### 编译失败（详见 artifact 里的 errors.txt）"
 }
 
 IMG="$OUT/arch/arm64/boot/Image.gz"
 
 log "编译 Image.gz（-j$JOBS）"
 set +e
-build_kernel 2>&1 | tail -80
+build_kernel 2>&1 | tail -40
 RC=${PIPESTATUS[0]}
 set -e
 
 if [ "$RC" -ne 0 ] || [ ! -f "$IMG" ]; then
   warn "首次编译失败（rc=$RC / Image.gz 存在=$([ -f "$IMG" ] && echo yes || echo no)）"
-  warn "关闭 DEBUG_INFO / BTF 后重试（只影响调试信息与 BPF CO-RE，不影响开机与 vermagic）"
-  for opt in DEBUG_INFO_BTF MODULES_DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES DEBUG_INFO; do
-    "$KERNEL_DIR/scripts/config" --file "$OUT/.config" -d "$opt" 2>/dev/null || true
-  done
-  make ARCH=arm64 O="$OUT" olddefconfig >/dev/null 2>&1 || true
-  set +e
-  build_kernel 2>&1 | tail -80
-  RC=${PIPESTATUS[0]}
-  set -e
+  # 只有确实跟 BTF/pahole 有关才值得重编一次；否则改配置要全量重编，白等几十分钟。
+  # 注意别用裸 "BTF" 匹配 —— 日志里 kernel/bpf/btf.o 这种路径到处都是。
+  if grep -aqE 'pahole|DEBUG_INFO_BTF|vmlinux\.btf' "$LOG"; then
+    warn "日志里出现 BTF/pahole 字样，关闭 DEBUG_INFO / BTF 后重试"
+    for opt in DEBUG_INFO_BTF MODULES_DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES DEBUG_INFO; do
+      "$KERNEL_DIR/scripts/config" --file "$OUT/.config" -d "$opt" 2>/dev/null || true
+    done
+    make ARCH=arm64 O="$OUT" olddefconfig >/dev/null 2>&1 || true
+    set +e
+    build_kernel 2>&1 | tail -40
+    RC=${PIPESTATUS[0]}
+    set -e
+  else
+    warn "与 BTF 无关，跳过重试直接报错"
+  fi
 fi
 
 if [ ! -f "$IMG" ]; then
-  echo
-  echo "======== build.log 最后 80 行 ========"
-  tail -80 "$LOG" 2>/dev/null || true
-  echo "======================================"
-  die "Image.gz 没生成（rc=$RC） —— 见上面的编译错误"
+  show_build_errors "$LOG"
+  die "Image.gz 没生成（rc=$RC） —— 见上面的编译失败摘要"
 fi
 gzip -t "$IMG" || die "Image.gz 不是合法的 gzip 文件"
 log "Image.gz 生成成功（$(du -h "$IMG" | cut -f1)）"

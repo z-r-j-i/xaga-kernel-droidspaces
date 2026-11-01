@@ -27,6 +27,7 @@ FRAGMENT="$SCRIPT_DIR/patches/containers.fragment"
 KERNEL_DIR="$SCRIPT_DIR/kernel"
 OUT="$SCRIPT_DIR/out"
 ART="$SCRIPT_DIR/artifacts"
+LOG="$SCRIPT_DIR/build.log"
 
 JOBS="${JOBS:-$(nproc)}"
 PROBE_ONLY=0
@@ -35,7 +36,11 @@ PROBE_ONLY=0
 export ARCH=arm64
 
 log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$*"; }
 die()  { printf '\n\033[1;31m[FAIL] %s\033[0m\n' "$*" >&2; exit 1; }
+
+# 全程 tee 到 build.log，失败时 workflow 能上传它
+exec > >(tee "$LOG") 2>&1
 
 # --------------------------- 1. 拉源码 --------------------------------------
 if [ ! -d "$KERNEL_DIR/.git" ]; then
@@ -81,18 +86,35 @@ CLANG_DIR="$SCRIPT_DIR/.clang"
 if [ ! -f "$CLANG_DIR/bin/clang" ]; then
   log "下载 clang r416183b（与原厂工具链一致）"
   mkdir -p "$CLANG_DIR"
-  URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz"
-  curl -fsSL "$URL" -o /tmp/clang.tar.gz || die "clang 下载失败"
-  tar -xzf /tmp/clang.tar.gz -C "$CLANG_DIR"
+  ok=0
+  # master 分支可能已移除旧 clang，android12-release 一定有；依次试
+  for branch in master android12-release android12-platform-release; do
+    URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${branch}/clang-r416183b.tar.gz"
+    echo "  尝试分支: $branch"
+    if curl -fsSL "$URL" -o /tmp/clang.tar.gz 2>/dev/null; then
+      if [ -s /tmp/clang.tar.gz ]; then
+        echo "  下载成功（$branch, $(du -h /tmp/clang.tar.gz | cut -f1)）"
+        tar -xzf /tmp/clang.tar.gz -C "$CLANG_DIR" && ok=1
+        break
+      fi
+    fi
+  done
   rm -f /tmp/clang.tar.gz
+  if [ "$ok" = "0" ]; then
+    warn "AOSP clang 下载失败，回退到系统 clang"
+    if command -v clang >/dev/null 2>&1; then
+      CLANG_SYS=1
+    else
+      die "系统 clang 也不可用，无法继续"
+    fi
+  fi
 fi
-export PATH="$CLANG_DIR/bin:$PATH"
+[ "${CLANG_SYS:-0}" != "1" ] && export PATH="$CLANG_DIR/bin:$PATH"
+
 CLANG_VER="$(clang --version | head -1)"
 log "工具链：$CLANG_VER"
-
-# 验证是 clang 12（r416183b）
 echo "$CLANG_VER" | grep -q "clang version 12" \
-  || warn "警告：clang 版本不是 12，vermagic 可能不匹配"
+  || warn "clang 不是 12（实际: $CLANG_VER）。/proc/version 行会不一致，但模块 vermagic 不受编译器影响"
 
 # --------------------------- 4. 生成配置 ------------------------------------
 log "合并 GKI defconfig + 容器配置片段"
@@ -102,10 +124,10 @@ rm -rf "$OUT" && mkdir -p "$OUT"
   arch/arm64/configs/gki_defconfig \
   "$FRAGMENT" 2>&1 | tail -5
 
-# 抑制 setlocalversion（不让 git 信息追加到版本串）
+# 抑制 setlocalversion（不让 git 信息追加到版本串，保留 CONFIG_LOCALVERSION 原值）
 touch .scmversion
 
-make ARCH=arm64 O="$OUT" olddefconfig >/dev/null 2>&1
+make ARCH=arm64 O="$OUT" olddefconfig 2>&1 | tail -5
 
 # 校验关键配置
 log "校验关键配置"
@@ -119,7 +141,7 @@ for s in CONFIG_CGROUP_DEVICE CONFIG_CGROUP_PIDS CONFIG_USER_NS \
     printf '  \033[31mMISS\033[0m %s\n' "$s"; MISSING="$MISSING $s"
   fi
 done
-[ -z "$MISSING" ] || die "关键配置缺失:$MISSING"
+[ -z "$MISSING" ] || die "关键配置缺失:$MISSING —— 这些是 Droidspaces 的硬性需求"
 
 # 验证 LOCALVERSION
 LV="$(grep '^CONFIG_LOCALVERSION=' "$OUT/.config" | cut -d'"' -f2)"
@@ -129,13 +151,21 @@ log "LOCALVERSION = $LV"
 
 # --------------------------- 5. 编译 ----------------------------------------
 log "编译 Image.gz（-j$JOBS）"
+# 不传 LOCALVERSION=（那会覆盖 CONFIG_LOCALVERSION 导致版本串丢失）
+# || true 让 make 失败不立即退出，下面检查 Image.gz 并输出完整错误
 make ARCH=arm64 O="$OUT" \
   CC=clang HOSTCC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
   KCFLAGS="-D__ANDROID_COMMON_KERNEL__" \
-  LOCALVERSION= \
-  -j"$JOBS" Image.gz 2>&1 | tail -30
+  -j"$JOBS" Image.gz 2>&1 | tail -50 || true
 
-[ -f "$OUT/arch/arm64/boot/Image.gz" ] || die "Image.gz 没生成"
+if [ ! -f "$OUT/arch/arm64/boot/Image.gz" ]; then
+  echo
+  echo "======== build.log 最后 60 行 ========"
+  tail -60 "$LOG" 2>/dev/null || true
+  echo "======================================"
+  die "Image.gz 没生成 —— 见上面的编译错误"
+fi
+log "Image.gz 生成成功"
 
 # --------------------------- 6. 收集产物 ------------------------------------
 rm -rf "$ART" && mkdir -p "$ART"
@@ -155,6 +185,7 @@ fi
   echo "source=$KERNEL_REPO@$KERNEL_BRANCH"
   echo "pin=$PINNED"
   echo "localversion=$LV"
+  echo "clang=$CLANG_VER"
   echo "image_sha256=$(sha256sum "$ART/Image.gz" | cut -d' ' -f1)"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$ART/BUILD-INFO.txt"
@@ -190,8 +221,8 @@ done
 ZIP="$ART/xaga-gki-5.10.226-containers-$(date -u +%Y%m%d).zip"
 rm -f "$ZIP"
 cd "$WORK"
-zip -r9 -q "$ZIP" anykernel.sh Image.gz tools META-INF \
-  && [ -f "$WORK/LICENSE" ] && zip -q9 "$ZIP" LICENSE || true
+zip -r9 -q "$ZIP" anykernel.sh Image.gz tools META-INF || die "zip 打包失败"
+[ -f "$WORK/LICENSE" ] && zip -q9 "$ZIP" LICENSE 2>/dev/null || true
 cd "$SCRIPT_DIR"
 
 # 校验包结构

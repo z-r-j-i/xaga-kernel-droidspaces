@@ -7,51 +7,41 @@ on:
     inputs:
       target_sublevel:
         description: '5.10.x sublevel (stock = 226)'
-        required: false
         default: '226'
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
-
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装编译依赖
+      - name: 腾出磁盘空间
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc; df -h /
+
+      - name: 安装工具链
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q \
-            build-essential bc bison flex libncurses-dev libssl-dev \
-            cpio zstd zip unzip python3 curl git
+          sudo apt-get install -y -q build-essential bc bison flex libncurses-dev libssl-dev cpio zstd zip unzip python3 curl git patch file dwarves libelf-dev clang-12 lld-12 llvm-12
+          echo "---- 工具链自检 ----"
+          /usr/lib/llvm-12/bin/clang --version | head -1
+          /usr/lib/llvm-12/bin/ld.lld --version | head -1
+          pahole --version || true
 
-      - name: 编译 + 打包
+      - name: 编译并打包
+        env:
+          TARGET_SUBLEVEL: ${{ github.event.inputs.target_sublevel || '226' }}
         run: |
           chmod +x build.sh
-          TARGET_SUBLEVEL="${{ github.event.inputs.target_sublevel || '226' }}" \
-            ./build.sh
+          ./build.sh
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: xaga-gki-kernel
           path: |
-            artifacts/*.zip
-            artifacts/*.sha256
-            artifacts/BUILD-INFO.txt
+            artifacts/*
             build.log
           if-no-files-found: ignore
           retention-days: 30
-
-      - name: 构建摘要
-        if: always()
-        run: |
-          echo "### 构建结果" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f artifacts/BUILD-INFO.txt ]; then
-            cat artifacts/BUILD-INFO.txt >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            ls -lh artifacts/ >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "未产出 artifacts" >> "$GITHUB_STEP_SUMMARY"
-            tail -30 build.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true

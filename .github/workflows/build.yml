@@ -33,12 +33,15 @@ jobs:
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: xaga-gki-kernel
           path: |
             artifacts/*.zip
             artifacts/*.sha256
             artifacts/BUILD-INFO.txt
+            build.log
+          if-no-files-found: ignore
           retention-days: 30
 
       - name: 构建摘要
@@ -52,4 +55,3 @@ jobs:
           else
             echo "未产出 artifacts" >> "$GITHUB_STEP_SUMMARY"
             tail -30 build.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
-          fi

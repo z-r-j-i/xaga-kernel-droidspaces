@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  xaga GKI 容器内核编译脚本  (v7)
+#  xaga GKI 容器内核编译脚本  (v8)
 #
 #  路线：AOSP android12-5.10 GKI 5.10.226 + Droidspaces 官方 kABI 补丁
 #
@@ -31,6 +31,15 @@
 #  用法：
 #    ./build.sh            完整编译 + 打包
 #    ./build.sh --probe    只探测版本，不编译
+#
+#  v8 变更（修掉真正的编译失败）：
+#   - 编译真正卡住的原因是 CONFIG_WERROR=y 把「栈帧偏大」警告升级成了错误：
+#       mm/madvise.c:do_madvise           2240 字节
+#       fs/quota/quota.c:__arm64_sys_quotactl 3424 字节
+#     超过 CONFIG_FRAME_WARN=2048 → -Werror 拦下 → mm/ 和 fs/ 编译失败
+#   - 原厂 clang r416183b(12.0.5) 算出不超，Ubuntu 只有 12.0.1，栈槽复用差一点
+#   - 处理：配置阶段 -d WERROR，同时 KCFLAGS 追加 -Wno-error=frame-larger-than 兜底
+#   - 这两项都不改生成代码、不改 kABI、不改 vermagic，只影响「警告是否致命」
 #
 #  v7 变更（专治「失败但看不到原因」）：
 #   - 编译输出不再经过 tail：全量 tee 进 build.log，屏幕只透传 error/LD/AR 等关键行，
@@ -316,6 +325,27 @@ touch .scmversion
 log "olddefconfig"
 make ARCH=arm64 O="$OUT" olddefconfig 2>&1 | tail -5
 
+# ---- 关掉 CONFIG_WERROR ----------------------------------------------------
+# 这一轮的编译失败就出在这里：
+#   mm/madvise.c:do_madvise        栈帧 2240 字节
+#   fs/quota/quota.c:__arm64_sys_quotactl 栈帧 3424 字节
+# 都超过 CONFIG_FRAME_WARN(=2048)，而顶层 Makefile 有
+#   KBUILD_CFLAGS-$(CONFIG_WERROR) += -Werror
+# 于是「栈帧偏大」这个警告被升级成错误，mm/ 和 fs/ 直接挂掉。
+#
+# 原厂用 AOSP clang r416183b（12.0.5）编译时算出的栈帧没超，而 Ubuntu 只有
+# clang 12.0.1，寄存器分配 / 栈槽复用差一点，同源代码就超了。
+# 这是工具链版本差异，不是代码缺陷：关掉 WERROR 只改变「警告是否致命」，
+# 不改变任何生成代码，不影响 kABI、不影响 vermagic、不影响开机。
+log "关闭 CONFIG_WERROR（工具链版本差异会把无害警告当错误）"
+./scripts/config --file "$OUT/.config" -d WERROR 2>/dev/null || true
+make ARCH=arm64 O="$OUT" olddefconfig >/dev/null 2>&1 || true
+if grep -qx 'CONFIG_WERROR=y' "$OUT/.config"; then
+  warn "CONFIG_WERROR 仍为 y（被别的选项 select 了），靠下面的 -Wno-error 兜底"
+else
+  log "CONFIG_WERROR 已关闭 ✓"
+fi
+
 # --------------------------- 5. 配置校验 ------------------------------------
 log "校验 Droidspaces 必需项（官方 GKI 清单）"
 MISSING=""
@@ -350,9 +380,12 @@ log "LOCALVERSION = $LV"
 build_kernel() {
   # 不传 LOCALVERSION=（会覆盖 CONFIG_LOCALVERSION）
   # -O：并行编译时把每个目标的输出整块打印，避免 error 被几十行 CC 冲散
+  # -Wno-error=frame-larger-than：双保险。万一 CONFIG_WERROR 被别的选项 select 回来，
+  #   这一条也放在命令行最后（KCFLAGS 在 Makefile 末尾追加），能覆盖前面的 -Werror。
+  #   栈帧 2~3KB 对 16KB 的内核栈是安全的，只是 Ubuntu clang 12.0.1 优化不如 12.0.5。
   make ARCH=arm64 O="$OUT" -O \
     "${MAKE_TOOL_ARGS[@]}" \
-    KCFLAGS="-D__ANDROID_COMMON_KERNEL__" \
+    KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error=frame-larger-than" \
     -j"$JOBS" Image.gz
 }
 

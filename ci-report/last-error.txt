@@ -1,0 +1,222 @@
+# 构建失败报告
+
+- run id: 41443370318
+- 时间(UTC): 2026-11-02T12:19:37Z
+
+xaga GKI 编译失败报告
+时间: 2026-11-02T12:19:37Z
+内核: 5.10.226   并发: -j4   日志行数: 1219
+clang: Ubuntu clang version 12.0.1-19ubuntu3   lld: Ubuntu LLD 12.0.1 (compatible with GNU linkers)
+磁盘: 107G 可用 / 已用 27%
+内存: 15Gi 总 / 可用 14Gi
+
+==== [1] make 失败目标 ====
+make[2]: *** [/home/runner/work/xaga-kernel-droidspaces/xaga-kernel-droidspaces/kernel/scripts/Makefile.build:273: scripts/mod/empty.o] Error 1
+make[2]: *** [/home/runner/work/xaga-kernel-droidspaces/xaga-kernel-droidspaces/kernel/scripts/Makefile.build:273: scripts/mod/empty.o] Error 1
+make[2]: *** [/home/runner/work/xaga-kernel-droidspaces/xaga-kernel-droidspaces/kernel/scripts/Makefile.build:117: scripts/mod/devicetable-offsets.s] Error 1
+make[2]: *** [/home/runner/work/xaga-kernel-droidspaces/xaga-kernel-droidspaces/kernel/scripts/Makefile.build:117: scripts/mod/devicetable-offsets.s] Error 1
+make[1]: *** [/home/runner/work/xaga-kernel-droidspaces/xaga-kernel-droidspaces/kernel/Makefile:1346: prepare0] Error 2
+make[1]: *** [/home/runner/work/xaga-kernel-droidspaces/xaga-kernel-droidspaces/kernel/Makefile:1346: prepare0] Error 2
+make: *** [Makefile:192: __sub-make] Error 2
+make: *** [Makefile:192: __sub-make] Error 2
+
+==== [2] 全部 error / 致命行（最多 80 条）====
+error: unknown warning option '-Werror=frame-larger-than'; did you mean '-Werror=frame-larger-than='? [-Werror,-Wunknown-warning-option]
+error: unknown warning option '-Werror=frame-larger-than'; did you mean '-Werror=frame-larger-than='? [-Werror,-Wunknown-warning-option]
+error: unknown warning option '-Werror=frame-larger-than'; did you mean '-Werror=frame-larger-than='? [-Werror,-Wunknown-warning-option]
+error: unknown warning option '-Werror=frame-larger-than'; did you mean '-Werror=frame-larger-than='? [-Werror,-Wunknown-warning-option]
+
+==== [3] 首个错误上下文（第 463 行）====
+  HDRINST usr/include/linux/if_hippi.h
+  HDRINST usr/include/linux/atmlec.h
+  HDRINST usr/include/linux/kdev_t.h
+  HDRINST usr/include/linux/serial_core.h
+  HDRINST usr/include/linux/toshiba.h
+  HOSTLD  scripts/genksyms/genksyms
+  HDRINST usr/include/linux/rpl.h
+  HDRINST usr/include/linux/resource.h
+  HDRINST usr/include/linux/cgroupstats.h
+  HDRINST usr/include/linux/sctp.h
+  HDRINST usr/include/linux/sched/types.h
+  HDRINST usr/include/linux/synclink.h
+  HDRINST usr/include/linux/blkzoned.h
+  HDRINST usr/include/linux/virtio_rng.h
+  HDRINST usr/include/linux/wireguard.h
+  HDRINST usr/include/linux/capi.h
+  HDRINST usr/include/linux/if_pppox.h
+  HDRINST usr/include/linux/sunrpc/debug.h
+  HOSTCC  scripts/extract-cert
+  HDRINST usr/include/linux/uleds.h
+  HDRINST usr/include/linux/cdrom.h
+  HDRINST usr/include/linux/f2fs.h
+  HDRINST usr/include/linux/memfd.h
+  HDRINST usr/include/linux/seg6.h
+  HDRINST usr/include/linux/ethtool_netlink.h
+  HDRINST usr/include/linux/cec.h
+  HDRINST usr/include/linux/ndctl.h
+  HDRINST usr/include/linux/watchdog.h
+  HDRINST usr/include/linux/vhost.h
+  HDRINST usr/include/linux/ip_vs.h
+error: unknown warning option '-Werror=frame-larger-than'; did you mean '-Werror=frame-larger-than='? [-Werror,-Wunknown-warning-option]
+make[2]: *** [/home/runner/work/xaga-kernel-droidspaces/xaga-kernel-droidspaces/kernel/scripts/Makefile.build:273: scripts/mod/empty.o] Error 1
+make[2]: *** Waiting for unfinished jobs....
+  CC      scripts/mod/empty.o
+error: unknown warning option '-Werror=frame-larger-than'; did you mean '-Werror=frame-larger-than='? [-Werror,-Wunknown-warning-option]
+make[2]: *** [/home/runner/work/xaga-kernel-droidspaces/xaga-kernel-droidspaces/kernel/scripts/Makefile.build:273: scripts/mod/empty.o] Error 1
+make[2]: *** Waiting for unfinished jobs....
+  HDRINST usr/include/linux/perf_event.h
+  HDRINST usr/include/linux/kcmp.h
+  HDRINST usr/include/linux/termios.h
+  HDRINST usr/include/linux/utime.h
+
+==== [5] 日志末尾 150 行 ====
+  HDRINST usr/include/linux/netfilter_ipv6/ip6t_REJECT.h
+  HDRINST usr/include/linux/netfilter_ipv6/ip6t_srh.h
+  HDRINST usr/include/linux/can/isotp.h
+  HDRINST usr/include/linux/vbox_vmmdev_types.h
+  HDRINST usr/include/linux/can/netlink.h
+  HDRINST usr/include/linux/can/gw.h
+  HDRINST usr/include/linux/can/j1939.h
+  HDRINST usr/include/linux/can/bcm.h
+  HDRINST usr/include/linux/can/vxcan.h
+  HDRINST usr/include/linux/can/error.h
+  HDRINST usr/include/linux/can/raw.h
+  HDRINST usr/include/linux/aio_abi.h
+  HDRINST usr/include/linux/atm_zatm.h
+  HDRINST usr/include/linux/kcm.h
+  HDRINST usr/include/linux/cm4000_cs.h
+  HDRINST usr/include/linux/nubus.h
+  HDRINST usr/include/linux/io_uring.h
+  HDRINST usr/include/linux/auxvec.h
+  HDRINST usr/include/linux/hpet.h
+  HDRINST usr/include/linux/qrtr.h
+  HDRINST usr/include/linux/if_cablemodem.h
+  HDRINST usr/include/linux/virtio_pci.h
+  HDRINST usr/include/linux/joystick.h
+  HDRINST usr/include/linux/batadv_packet.h
+  HDRINST usr/include/linux/xilinx-v4l2-controls.h
+  HDRINST usr/include/linux/ip.h
+  HDRINST usr/include/linux/udmabuf.h
+  HDRINST usr/include/linux/v4l2-mediabus.h
+  HDRINST usr/include/linux/openat2.h
+  HDRINST usr/include/linux/firewire-constants.h
+  HDRINST usr/include/linux/rxrpc.h
+  HDRINST usr/include/linux/vfio_zdev.h
+  HDRINST usr/include/misc/fastrpc.h
+  HDRINST usr/include/misc/cxl.h
+  HDRINST usr/include/misc/ocxl.h
+  HDRINST usr/include/misc/xilinx_sdfec.h
+  HDRINST usr/include/misc/pvpanic.h
+  HDRINST usr/include/misc/uacce/uacce.h
+  HDRINST usr/include/misc/uacce/hisi_qm.h
+  HDRINST usr/include/mtd/mtd-abi.h
+  HDRINST usr/include/misc/habanalabs.h
+  HDRINST usr/include/mtd/nftl-user.h
+  HDRINST usr/include/mtd/inftl-user.h
+  HDRINST usr/include/mtd/mtd-user.h
+  HDRINST usr/include/rdma/ib_user_ioctl_verbs.h
+  HDRINST usr/include/rdma/rdma_user_rxe.h
+  HDRINST usr/include/mtd/ubi-user.h
+  HDRINST usr/include/rdma/rdma_netlink.h
+  HDRINST usr/include/rdma/rvt-abi.h
+  HDRINST usr/include/rdma/ib_user_ioctl_cmds.h
+  HDRINST usr/include/rdma/mlx5_user_ioctl_verbs.h
+  HDRINST usr/include/rdma/vmw_pvrdma-abi.h
+  HDRINST usr/include/rdma/rdma_user_ioctl_cmds.h
+  HDRINST usr/include/rdma/mlx4-abi.h
+  HDRINST usr/include/rdma/rdma_user_cm.h
+  HDRINST usr/include/rdma/qedr-abi.h
+  HDRINST usr/include/rdma/efa-abi.h
+  HDRINST usr/include/rdma/ib_user_mad.h
+  HDRINST usr/include/rdma/ocrdma-abi.h
+  HDRINST usr/include/rdma/mlx5-abi.h
+  HDRINST usr/include/rdma/siw-abi.h
+  HDRINST usr/include/rdma/hns-abi.h
+  HDRINST usr/include/rdma/i40iw-abi.h
+  HDRINST usr/include/rdma/hfi/hfi1_ioctl.h
+  HDRINST usr/include/rdma/hfi/hfi1_user.h
+  HDRINST usr/include/rdma/mlx5_user_ioctl_cmds.h
+  HDRINST usr/include/rdma/cxgb4-abi.h
+  HDRINST usr/include/rdma/rdma_user_ioctl.h
+  HDRINST usr/include/rdma/mthca-abi.h
+  HDRINST usr/include/rdma/bnxt_re-abi.h
+  HDRINST usr/include/rdma/ib_user_sa.h
+  HDRINST usr/include/scsi/scsi_bsg_ufs.h
+  HDRINST usr/include/scsi/scsi_netlink_fc.h
+  HDRINST usr/include/scsi/scsi_bsg_fc.h
+  HDRINST usr/include/rdma/ib_user_verbs.h
+  HDRINST usr/include/scsi/scsi_netlink.h
+  HDRINST usr/include/scsi/fc/fc_ns.h
+  HDRINST usr/include/scsi/fc/fc_gs.h
+  HDRINST usr/include/scsi/fc/fc_fs.h
+  HDRINST usr/include/scsi/fc/fc_els.h
+  HDRINST usr/include/scsi/cxlflash_ioctl.h
+  HDRINST usr/include/sound/asequencer.h
+  HDRINST usr/include/sound/skl-tplg-interface.h
+  HDRINST usr/include/sound/sof/abi.h
+  HDRINST usr/include/sound/sof/fw.h
+  HDRINST usr/include/sound/sof/tokens.h
+  HDRINST usr/include/sound/sof/header.h
+  HDRINST usr/include/sound/usb_stream.h
+  HDRINST usr/include/sound/sfnt_info.h
+  HDRINST usr/include/sound/compress_params.h
+  HDRINST usr/include/sound/compress_offload.h
+  HDRINST usr/include/sound/tlv.h
+  HDRINST usr/include/sound/asoc.h
+  HDRINST usr/include/sound/asound_fm.h
+  HDRINST usr/include/sound/sb16_csp.h
+  HDRINST usr/include/sound/firewire.h
+  HDRINST usr/include/sound/snd_sst_tokens.h
+  HDRINST usr/include/sound/hdsp.h
+  HDRINST usr/include/sound/hdspm.h
+  HDRINST usr/include/sound/emu10k1.h
+  HDRINST usr/include/video/uvesafb.h
+  HDRINST usr/include/video/sisfb.h
+  HDRINST usr/include/sound/asound.h
+  HDRINST usr/include/video/edid.h
+  HDRINST usr/include/xen/gntalloc.h
+  HDRINST usr/include/xen/evtchn.h
+  HDRINST usr/include/xen/gntdev.h
+  HDRINST usr/include/linux/version.h
+  HDRINST usr/include/xen/privcmd.h
+  HDRINST usr/include/asm/param.h
+  HDRINST usr/include/asm/unistd.h
+  HDRINST usr/include/asm/ptrace.h
+  HDRINST usr/include/asm/hwcap.h
+  HDRINST usr/include/asm/perf_regs.h
+  HDRINST usr/include/asm/mman.h
+  HDRINST usr/include/asm/posix_types.h
+  HDRINST usr/include/asm/signal.h
+  HDRINST usr/include/asm/byteorder.h
+  HDRINST usr/include/asm/sigcontext.h
+  HDRINST usr/include/asm/bpf_perf_event.h
+  HDRINST usr/include/asm/kvm.h
+  HDRINST usr/include/asm/statfs.h
+  HDRINST usr/include/asm/fcntl.h
+  HDRINST usr/include/asm/ucontext.h
+  HDRINST usr/include/asm/setup.h
+  HDRINST usr/include/asm/bitsperlong.h
+  HDRINST usr/include/asm/sve_context.h
+  HDRINST usr/include/asm/auxvec.h
+  HDRINST usr/include/asm/ioctl.h
+  HDRINST usr/include/asm/socket.h
+  HDRINST usr/include/asm/termios.h
+  HDRINST usr/include/asm/resource.h
+  HDRINST usr/include/asm/errno.h
+  HDRINST usr/include/asm/sockios.h
+  HDRINST usr/include/asm/types.h
+  HDRINST usr/include/asm/shmbuf.h
+  HDRINST usr/include/asm/kvm_para.h
+  HDRINST usr/include/asm/swab.h
+  HDRINST usr/include/asm/termbits.h
+  HDRINST usr/include/asm/ipcbuf.h
+  HDRINST usr/include/asm/sembuf.h
+  HDRINST usr/include/asm/ioctls.h
+  HDRINST usr/include/asm/stat.h
+  HDRINST usr/include/asm/poll.h
+  HDRINST usr/include/asm/msgbuf.h
+  HDRINST usr/include/asm/siginfo.h
+make: *** [Makefile:192: __sub-make] Error 2
+make: *** [Makefile:192: __sub-make] Error 2
+[1;33m[WARN] 首次编译失败（rc=2 / Image.gz 存在=no）[0m
+[1;33m[WARN] 与 BTF 无关，跳过重试直接报错[0m

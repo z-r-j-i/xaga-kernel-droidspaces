@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  xaga GKI 容器内核编译脚本  (v8)
+#  xaga GKI 容器内核编译脚本  (v10)
 #
 #  路线：AOSP android12-5.10 GKI 5.10.226 + Droidspaces 官方 kABI 补丁
+#
+#  v10 变更（严格对齐官方 Kernel-Configuration.md 的 GKI 流程）：
+#   - 配置方式改为官方要求的「原地编辑 arch/arm64/configs/gki_defconfig」，
+#     不再用 merge_config + fragment（官方原文：Edit gki_defconfig in place
+#     rather than adding a fragment）
+#   - 配置项清单与官方 GKI Step 2 逐项一致（必需 6 项 + 推荐 13 项）
+#   - KABI_SLOT 支持环境变量强制指定（官方：6_7_8 bootloop 就换 1_2_3/3_4_5）
 #
 #  为什么是这条路（由 Droidspaces 官方 Kernel-Configuration.md 决定）：
 #   - 原厂是 GKI 内核，厂商代码全在 vendor_dlkm/vendor_boot 的 608 个 .ko 里
@@ -70,10 +77,14 @@ STOCK_LOCALVERSION="${STOCK_LOCALVERSION:--android12-9-00047-g4968e29b7f92-ab127
 PATCH_BASE="${PATCH_BASE:-https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12}"
 # 001 有三个变体，占用不同的 ANDROID_KABI_RESERVE 槽位。
 # 官方建议先试 6_7_8；若开机循环，改用 1_2_3 或 3_4_5。
+# 通过环境变量显式指定时（如 workflow 里选 slot），只用指定的那个，不许回退——
+# 否则「换 slot 测试」会被静默回退成 6_7_8，白测一轮。
+KABI_SLOT_FORCED="${KABI_SLOT:-}"
 KABI_SLOT="${KABI_SLOT:-6_7_8}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FRAGMENT="$SCRIPT_DIR/patches/containers.fragment"
+# patches/containers.fragment 留作参考文档；v10 起按官方方法原地改 gki_defconfig，
+# 不再用 merge_config fragment
 KERNEL_DIR="$SCRIPT_DIR/kernel"
 OUT="$SCRIPT_DIR/out"
 ART="$SCRIPT_DIR/artifacts"
@@ -188,8 +199,14 @@ P001_FMT="$PATCH_BASE/001.GKI-below-6.12-fix_sysvipc_kabi_%s.patch"
 P002="$PATCH_BASE/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
 
 log "打 Droidspaces kABI 补丁 001（SYSVIPC → ABI padding）"
+if [ -n "$KABI_SLOT_FORCED" ]; then
+  log "本次强制使用槽位：$KABI_SLOT_FORCED（不回退）"
+  SLOT_LIST=("$KABI_SLOT_FORCED")
+else
+  SLOT_LIST=(6_7_8 1_2_3 3_4_5)
+fi
 APPLIED_SLOT=""
-for slot in "$KABI_SLOT" 1_2_3 3_4_5 6_7_8; do
+for slot in "${SLOT_LIST[@]}"; do
   [ -n "$APPLIED_SLOT" ] && break
   url="$(printf "$P001_FMT" "$slot")"
   rm -f /tmp/001.patch
@@ -310,20 +327,70 @@ fi
 log "目标确认：生成的 .o 为 AArch64 ✓"
 
 # --------------------------- 4. 生成配置 ------------------------------------
-log "合并 gki_defconfig + Droidspaces fragment"
-rm -rf "$OUT" && mkdir -p "$OUT"
+# 官方方法（Kernel-Configuration.md GKI Step 2 原文）：
+#   "Edit arch/arm64/configs/gki_defconfig in place rather than adding a fragment.
+#    For each option below, find it in the file: change '# CONFIG_X is not set'
+#    to 'CONFIG_X=y', leave it alone if it is already on, and add it at the end
+#    if it is absent."
+# 即：直接原地改 gki_defconfig，不用 merge_config fragment。
+log "按官方方法原地编辑 gki_defconfig（不用 fragment）"
+GKI_CFG="arch/arm64/configs/gki_defconfig"
+[ -f "$GKI_CFG" ] || die "$GKI_CFG 不存在"
 
-./scripts/kconfig/merge_config.sh -m \
-  arch/arm64/configs/gki_defconfig \
-  "$FRAGMENT" 2>&1 | tail -8
+# 官方 GKI 清单（必需 + 可选但推荐），与文档逐项对应：
+OFFICIAL_OPTS=(
+  # 必需
+  CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE
+  CONFIG_IPC_NS CONFIG_PID_NS
+  CONFIG_DEVTMPFS
+  CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
+  # 可选但推荐
+  CONFIG_USER_NS
+  CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE
+  CONFIG_MACVLAN
+  # UFW
+  CONFIG_NETFILTER_XT_TARGET_REJECT CONFIG_NETFILTER_XT_TARGET_LOG
+  CONFIG_NETFILTER_XT_MATCH_RECENT
+  # Fail2ban
+  CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET CONFIG_NETFILTER_XT_SET
+  # tmpfs
+  CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR
+)
 
-# merge_config.sh 把结果写到源码根的 .config，而 make O=$OUT 读的是 $OUT/.config。
-# 不搬过去的话 olddefconfig 会从零生成默认配置，前面合并的 fragment 全部丢失。
-if [ -f .config ]; then
-  cp -f .config "$OUT/.config"
-  rm -f .config
+set_opt_in_defconfig() {
+  # 官方规则：已是 y → 不动；是 "# CONFIG_X is not set" → 改成 y；没有 → 追加到末尾
+  local opt="$1" val="$2"
+  if [ "$val" = "y" ]; then
+    if grep -qx "$opt=y" "$GKI_CFG"; then
+      return 0
+    elif grep -qx "# $opt is not set" "$GKI_CFG"; then
+      sed -i "s|^# $opt is not set$|$opt=y|" "$GKI_CFG"
+    elif grep -q "^$opt=" "$GKI_CFG"; then
+      sed -i "s|^$opt=.*|$opt=y|" "$GKI_CFG"
+    else
+      echo "$opt=y" >> "$GKI_CFG"
+    fi
+  fi
+}
+
+for opt in "${OFFICIAL_OPTS[@]}"; do
+  set_opt_in_defconfig "$opt" y
+done
+log "gki_defconfig 已按官方清单开启 ${#OFFICIAL_OPTS[@]} 项"
+
+# vermagic 对齐（官方文档没写这条，因为它假定你用 AOSP 构建系统，LOCALVERSION
+# 由构建系统注入；我们用裸 make，必须显式设，否则 608 个原厂模块 vermagic 对不上
+# → 开机循环。实测 run #18 用此法编出的 kernel.release 与原厂逐字节一致）
+if grep -q "^CONFIG_LOCALVERSION=" "$GKI_CFG"; then
+  sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$STOCK_LOCALVERSION\"|" "$GKI_CFG"
+else
+  echo "CONFIG_LOCALVERSION=\"$STOCK_LOCALVERSION\"" >> "$GKI_CFG"
 fi
-[ -s "$OUT/.config" ] || die "合并后 $OUT/.config 不存在 —— merge_config 失败了"
+
+rm -rf "$OUT" && mkdir -p "$OUT"
+# 用改过的 gki_defconfig 直接生成 .config（这就是官方 "edit in place" 的效果）
+make ARCH=arm64 O="$OUT" gki_defconfig 2>&1 | tail -3
+[ -s "$OUT/.config" ] || die "make gki_defconfig 后 $OUT/.config 不存在"
 
 # 抑制 setlocalversion（版本串只保留 CONFIG_LOCALVERSION 的原值）
 touch .scmversion

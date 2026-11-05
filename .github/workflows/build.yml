@@ -9,6 +9,15 @@ on:
         description: '5.10.x sublevel (stock = 226)'
         required: false
         default: '226'
+      kabi_slot:
+        description: 'kABI padding 槽位：默认 6_7_8；刷完开机循环就换 1_2_3，再不行换 3_4_5（官方文档原文建议）'
+        required: false
+        default: '6_7_8'
+        type: choice
+        options:
+          - '6_7_8'
+          - '1_2_3'
+          - '3_4_5'
 
 # 需要写权限：失败时把报告 commit 回仓库，省掉「下载 artifact → 解压 → 发文件」这一步
 permissions:
@@ -57,6 +66,7 @@ jobs:
       - name: 编译并打包
         env:
           TARGET_SUBLEVEL: ${{ github.event.inputs.target_sublevel || '226' }}
+          KABI_SLOT: ${{ github.event.inputs.kabi_slot || '6_7_8' }}
         run: |
           chmod +x build.sh
           ./build.sh
